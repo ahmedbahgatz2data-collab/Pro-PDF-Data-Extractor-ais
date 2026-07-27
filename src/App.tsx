@@ -94,8 +94,9 @@ export default function App() {
     setIsProcessing(false);
   };
 
-  const processPDFs = async () => {
-    if (!selectedFiles.length) {
+  const processPDFs = async (overrideFiles?: File[]) => {
+    const filesToUse = overrideFiles || selectedFiles;
+    if (!filesToUse.length) {
       alert('Please select at least one PDF file.');
       return;
     }
@@ -123,7 +124,7 @@ export default function App() {
         : [];
 
     const results: ExtractedRow[] = [];
-    const totalFiles = selectedFiles.length;
+    const totalFiles = filesToUse.length;
     let completedCount = 0;
     const startTime = performance.now();
 
@@ -201,7 +202,7 @@ export default function App() {
 
     for (let i = 0; i < totalFiles; i += CONCURRENCY_LIMIT) {
       if (isAbortedRef.current) break;
-      const chunk = selectedFiles.slice(i, i + CONCURRENCY_LIMIT);
+      const chunk = filesToUse.slice(i, i + CONCURRENCY_LIMIT);
       await Promise.all(chunk.map((file) => worker(file)));
     }
 
@@ -319,6 +320,18 @@ export default function App() {
               <DropZone
                 files={selectedFiles}
                 onFilesAdded={handleFilesAdded}
+                onFilesAddedAndExtractDirectly={(newFiles) => {
+                  setSelectedFiles((prev) => {
+                    const updated = [...prev];
+                    newFiles.forEach((file) => {
+                      if (!updated.some((f) => f.name === file.name && f.size === file.size)) {
+                        updated.push(file);
+                      }
+                    });
+                    setTimeout(() => processPDFs(updated), 50);
+                    return updated;
+                  });
+                }}
                 onFileRemoved={handleFileRemoved}
                 onClearAll={handleClearAll}
                 disabled={isProcessing}

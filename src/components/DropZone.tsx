@@ -4,6 +4,7 @@ import { FileText, Upload, Trash2, X, ChevronDown, ChevronUp, Layers, Link as Li
 interface DropZoneProps {
   files: File[];
   onFilesAdded: (files: File[]) => void;
+  onFilesAddedAndExtractDirectly?: (files: File[]) => void;
   onFileRemoved: (index: number) => void;
   onClearAll: () => void;
   disabled?: boolean;
@@ -12,6 +13,7 @@ interface DropZoneProps {
 export const DropZone: React.FC<DropZoneProps> = ({
   files,
   onFilesAdded,
+  onFilesAddedAndExtractDirectly,
   onFileRemoved,
   onClearAll,
   disabled = false,
@@ -63,7 +65,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
     }
   };
 
-  const handleFetchUrls = async () => {
+  const handleFetchUrls = async (autoExtract = false) => {
     setUrlStatus(null);
     const rawUrls = urlInput
       .split(/[\n,]+/)
@@ -84,16 +86,27 @@ export const DropZone: React.FC<DropZoneProps> = ({
 
     for (const url of rawUrls) {
       try {
-        const response = await fetch(url);
+        // First try server proxy route to bypass browser CORS restrictions
+        let response = await fetch(`/api/proxy-pdf?url=${encodeURIComponent(url)}`);
+        
+        // If server proxy fails or is not available, try direct fetch as fallback
+        if (!response.ok) {
+          response = await fetch(url);
+        }
+
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
+
         const blob = await response.blob();
         
         // Derive filename from URL
         let fileName = url.substring(url.lastIndexOf('/') + 1).split('?')[0];
         if (!fileName || !fileName.toLowerCase().endsWith('.pdf')) {
-          fileName = `downloaded_${Date.now()}.pdf`;
+          fileName = `${fileName || 'document'}_${Date.now()}.pdf`;
+        }
+        if (!fileName.toLowerCase().endsWith('.pdf')) {
+          fileName += '.pdf';
         }
         
         const file = new File([blob], fileName, { type: 'application/pdf' });
@@ -112,13 +125,19 @@ export const DropZone: React.FC<DropZoneProps> = ({
       if (errors.length === 0) {
         setUrlStatus({
           type: 'success',
-          message: `Successfully loaded ${fetchedFiles.length} PDF(s) from URL!`,
+          message: autoExtract
+            ? `Loaded ${fetchedFiles.length} PDF(s) and started extraction!`
+            : `Successfully loaded ${fetchedFiles.length} PDF(s) to queue!`,
         });
       } else {
         setUrlStatus({
           type: 'error',
           message: `Loaded ${fetchedFiles.length} PDF(s). Failed: ${errors.join(', ')}`,
         });
+      }
+
+      if (autoExtract && onFilesAddedAndExtractDirectly) {
+        onFilesAddedAndExtractDirectly(fetchedFiles);
       }
     } else {
       setUrlStatus({
@@ -235,29 +254,52 @@ export const DropZone: React.FC<DropZoneProps> = ({
             className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all shadow-2xs"
           />
 
-          <div className="flex items-center justify-between gap-3">
-            <button
-              type="button"
-              onClick={handleFetchUrls}
-              disabled={disabled || isFetchingUrl || !urlInput.trim()}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs transition-colors flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isFetchingUrl ? (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  Downloading PDF(s)...
-                </>
-              ) : (
-                <>
-                  <Download className="w-3.5 h-3.5" />
-                  Fetch & Add to Queue (إضافة للملفات)
-                </>
-              )}
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2.5 pt-1">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Button 1: Add to Queue */}
+              <button
+                type="button"
+                onClick={() => handleFetchUrls(false)}
+                disabled={disabled || isFetchingUrl || !urlInput.trim()}
+                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl font-bold text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isFetchingUrl ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Fetching...
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5 text-slate-300" />
+                    Fetch & Add to Queue (إضافة للطابور)
+                  </>
+                )}
+              </button>
+
+              {/* Button 2: Fetch & Extract Directly */}
+              <button
+                type="button"
+                onClick={() => handleFetchUrls(true)}
+                disabled={disabled || isFetchingUrl || !urlInput.trim()}
+                className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isFetchingUrl ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5" />
+                    ⚡ Fetch & Extract Directly (جلب واستخراج فوراً)
+                  </>
+                )}
+              </button>
+            </div>
 
             {files.length > 0 && (
               <span className="text-xs text-blue-700 font-bold bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-200">
-                Current Queue: {files.length} file(s)
+                Queue: {files.length} file(s)
               </span>
             )}
           </div>
