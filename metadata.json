@@ -1,0 +1,6 @@
+{
+  "name": "Pro PDF Data Extractor",
+  "description": "Extract structured text, target line numbers, or key-value data from multiple PDF files into Excel (.xlsx) spreadsheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
