@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ExtractedRow } from '../types';
-import { Download, Search, FileSpreadsheet, CheckCircle2, ChevronDown, ChevronUp, Eye, EyeOff, Trash2 } from 'lucide-react';
+import { Download, Search, FileSpreadsheet, CheckCircle2, ChevronDown, ChevronUp, Eye, EyeOff, Trash2, ExternalLink } from 'lucide-react';
 
 interface ResultsTableProps {
   data: ExtractedRow[];
@@ -152,16 +152,34 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                     {headers.map((header) => {
                       const value = String(row[header] ?? '');
                       const isNotFound = value === '[Not Found]' || value.startsWith('[File Read Error');
+                      const isLink = value.startsWith('http://') || value.startsWith('https://');
+                      const isMultiline = value.includes('\n');
+
                       return (
                         <td
                           key={header}
-                          className="py-2 px-3 border-r border-slate-200/60 dark:border-slate-800 last:border-r-0 max-w-xs truncate"
+                          className={`py-2 px-3 border-r border-slate-200/60 dark:border-slate-800 last:border-r-0 ${
+                            isMultiline ? 'max-w-sm whitespace-pre-line align-top leading-relaxed' : 'max-w-xs truncate'
+                          }`}
                           title={value}
                         >
                           {isNotFound ? (
                             <span className="inline-block text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 px-1.5 py-0.5 rounded text-[11px] font-sans font-medium border border-amber-200 dark:border-amber-800">
                               {value}
                             </span>
+                          ) : isLink ? (
+                            <a
+                              href={value}
+                              target="_blank"
+                              rel="noreferrer noopener"
+                              className="text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 font-sans text-xs"
+                              title={value}
+                            >
+                              <span className="truncate max-w-[200px]">{value}</span>
+                              <ExternalLink className="w-3 h-3 shrink-0 opacity-70" />
+                            </a>
+                          ) : isMultiline ? (
+                            <div className="max-h-28 overflow-y-auto pr-1">{value}</div>
                           ) : (
                             value
                           )}
@@ -187,3 +205,4 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
     </div>
   );
 };
+

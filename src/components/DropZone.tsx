@@ -47,6 +47,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
   // Pause / Resume / Cancel states & refs
   const isPausedRef = useRef(false);
   const isCancelledRef = useRef(false);
+  const activeAbortControllersRef = useRef<Set<AbortController>>(new Set());
   const [isPaused, setIsPaused] = useState(false);
 
   // Loading & Download Progress state
@@ -84,6 +85,8 @@ export const DropZone: React.FC<DropZoneProps> = ({
   const handleCancel = () => {
     isCancelledRef.current = true;
     isPausedRef.current = false;
+    activeAbortControllersRef.current.forEach((controller) => controller.abort());
+    activeAbortControllersRef.current.clear();
     setIsPaused(false);
     setIsFetchingUrl(false);
     setLoadProgress((prev) => ({ ...prev, active: false }));
@@ -185,72 +188,103 @@ export const DropZone: React.FC<DropZoneProps> = ({
     setIsPaused(false);
     setIsFetchingUrl(true);
 
+    const urlConcurrency = Math.min(6, rawUrls.length);
+
     setLoadProgress({
       active: true,
-      title: `Downloading 1 of ${rawUrls.length} PDF(s) from URL...`,
+      title: `Downloading ${rawUrls.length} PDF(s) in parallel (${urlConcurrency}x threads)...`,
       current: 0,
       total: rawUrls.length,
       percent: 0,
     });
 
-    const fetchedFiles: File[] = [];
-    const errors: string[] = [];
+    const fetchedFilesSlots: (File | null)[] = new Array(rawUrls.length).fill(null);
+    const errorsSlots: (string | null)[] = new Array(rawUrls.length).fill(null);
+    let nextUrlIndex = 0;
+    let completedCount = 0;
 
-    for (let i = 0; i < rawUrls.length; i++) {
-      if (await checkPauseOrCancel()) break;
+    async function fetchWorker() {
+      while (true) {
+        if (await checkPauseOrCancel()) break;
 
-      const url = rawUrls[i];
-      const startPct = Math.round((i / rawUrls.length) * 100);
-      setLoadProgress({
-        active: true,
-        title: `Fetching (${i + 1}/${rawUrls.length}): ${url.slice(0, 35)}...`,
-        current: i + 1,
-        total: rawUrls.length,
-        percent: startPct,
-      });
+        const idx = nextUrlIndex++;
+        if (idx >= rawUrls.length) break;
 
-      try {
-        let response = await fetch(`/api/proxy-pdf?url=${encodeURIComponent(url)}`);
-        
-        if (!response.ok) {
-          response = await fetch(url);
+        const url = rawUrls[idx];
+        const controller = new AbortController();
+        activeAbortControllersRef.current.add(controller);
+
+        try {
+          let response = await fetch(`/api/proxy-pdf?url=${encodeURIComponent(url)}`, {
+            signal: controller.signal,
+          });
+          let proxyErrorMsg = '';
+
+          if (!response.ok) {
+            try {
+              const errJson = await response.json();
+              if (errJson?.error) proxyErrorMsg = errJson.error;
+            } catch {
+              proxyErrorMsg = `HTTP ${response.status}: ${response.statusText}`;
+            }
+
+            // Fallback to direct browser fetch (useful for local/intranet URLs)
+            try {
+              const directResponse = await fetch(url, { signal: controller.signal });
+              if (directResponse.ok) {
+                response = directResponse;
+              } else {
+                throw new Error(proxyErrorMsg || `HTTP ${directResponse.status}: ${directResponse.statusText}`);
+              }
+            } catch (directErr: any) {
+              if (directErr?.name === 'AbortError') throw directErr;
+              throw new Error(proxyErrorMsg || directErr?.message || 'CORS or Network Error');
+            }
+          }
+
+          const blob = await response.blob();
+          if (isCancelledRef.current) break;
+
+          let fileName = url.substring(url.lastIndexOf('/') + 1).split('?')[0];
+          if (!fileName || !fileName.toLowerCase().endsWith('.pdf')) {
+            fileName = `${fileName || 'document'}_${Date.now()}_${idx + 1}.pdf`;
+          }
+          if (!fileName.toLowerCase().endsWith('.pdf')) {
+            fileName += '.pdf';
+          }
+
+          const file = new File([blob], fileName, { type: 'application/pdf' });
+          (file as any).sourceUrl = url;
+          fetchedFilesSlots[idx] = file;
+
+          // Instantly enter file into queue as soon as fetched!
+          onFilesAdded([file]);
+        } catch (err: any) {
+          if (err?.name !== 'AbortError' && !isCancelledRef.current) {
+            console.error('Failed to fetch PDF from URL:', url, err);
+            errorsSlots[idx] = `${url.slice(0, 35)}... (${err?.message || 'CORS or Network Error'})`;
+          }
+        } finally {
+          activeAbortControllersRef.current.delete(controller);
+          if (!isCancelledRef.current) {
+            completedCount++;
+            const endPct = Math.round((completedCount / rawUrls.length) * 100);
+            setLoadProgress({
+              active: true,
+              title: `Downloaded ${completedCount} of ${rawUrls.length} PDF(s) (${urlConcurrency}x parallel)`,
+              current: completedCount,
+              total: rawUrls.length,
+              percent: endPct,
+            });
+          }
         }
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const blob = await response.blob();
-        
-        let fileName = url.substring(url.lastIndexOf('/') + 1).split('?')[0];
-        if (!fileName || !fileName.toLowerCase().endsWith('.pdf')) {
-          fileName = `${fileName || 'document'}_${Date.now()}.pdf`;
-        }
-        if (!fileName.toLowerCase().endsWith('.pdf')) {
-          fileName += '.pdf';
-        }
-        
-        const file = new File([blob], fileName, { type: 'application/pdf' });
-        fetchedFiles.push(file);
-
-        // Instantly enter file into queue as soon as fetched!
-        onFilesAdded([file]);
-      } catch (err: any) {
-        console.error('Failed to fetch PDF from URL:', url, err);
-        errors.push(`${url.slice(0, 30)}... (${err?.message || 'CORS or Network Error'})`);
       }
-
-      if (await checkPauseOrCancel()) break;
-
-      const endPct = Math.round(((i + 1) / rawUrls.length) * 100);
-      setLoadProgress({
-        active: true,
-        title: `Downloaded ${i + 1} of ${rawUrls.length} PDF(s)`,
-        current: i + 1,
-        total: rawUrls.length,
-        percent: endPct,
-      });
     }
+
+    await Promise.all(Array.from({ length: urlConcurrency }, () => fetchWorker()));
+
+    const fetchedFiles = fetchedFilesSlots.filter((f): f is File => f !== null);
+    const errors = errorsSlots.filter((e): e is string => e !== null);
 
     setIsFetchingUrl(false);
     setTimeout(() => {

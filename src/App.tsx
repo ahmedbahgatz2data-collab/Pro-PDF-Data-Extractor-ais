@@ -1,14 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ExtractMode, ScanMode, ExtractedRow } from './types';
+import { ExtractMode, ScanMode, ExtractedRow, KeywordMatchTarget, KeywordLineSeparator } from './types';
 import { DropZone } from './components/DropZone';
 import { ExtractionSettings } from './components/ExtractionSettings';
 import { ResultsTable } from './components/ResultsTable';
 import {
   extractFastLines,
+  extractTablesFromPDF,
   parseLineNumbers,
   findAllKeywordMatches,
   exportToXLSX,
 } from './utils/pdfExtractor';
+import { generateUserGuidePDF } from './utils/generateUserGuidePDF';
+import { UserGuideModal } from './components/UserGuideModal';
+import {
+  saveFilesToDB,
+  loadFilesFromDB,
+  clearFilesFromDB,
+  saveExtractedDataToDB,
+  loadExtractedDataFromDB,
+  clearExtractedDataFromDB,
+} from './utils/storage';
 import {
   FileSpreadsheet,
   XCircle,
@@ -31,6 +42,10 @@ export default function App() {
   const [extractMode, setExtractMode] = useState<ExtractMode>('line_numbers');
   const [targetInput, setTargetInput] = useState<string>('');
   const [targetKeywordsInput, setTargetKeywordsInput] = useState<string>('');
+  const [keywordTarget, setKeywordTarget] = useState<KeywordMatchTarget>('smart');
+  const [keywordLineOffset, setKeywordLineOffset] = useState<number>(1);
+  const [keywordLineCount, setKeywordLineCount] = useState<number>(1);
+  const [keywordLineSeparator, setKeywordLineSeparator] = useState<KeywordLineSeparator>('newline');
   const [scanMode, setScanMode] = useState<ScanMode>('all_pages');
 
   // Theme State (light | dark) - Default to 'dark'
@@ -51,6 +66,7 @@ export default function App() {
 
   const [extractedData, setExtractedData] = useState<ExtractedRow[]>([]);
   const [hasReport, setHasReport] = useState<boolean>(false);
+  const [isUserGuideOpen, setIsUserGuideOpen] = useState<boolean>(false);
 
   const isAbortedRef = useRef<boolean>(false);
 
@@ -72,30 +88,92 @@ export default function App() {
     }
   }, [theme]);
 
-  // Load preferences on mount
+  // Load preferences and restore persisted files & extracted data on mount
   useEffect(() => {
     try {
       const mode = localStorage.getItem('pdf_extract_mode') as ExtractMode | null;
       const input = localStorage.getItem('pdf_target_input');
       const kwInput = localStorage.getItem('pdf_target_keywords');
+      const kwTarget = localStorage.getItem('pdf_keyword_target') as KeywordMatchTarget | null;
+      const kwOffset = localStorage.getItem('pdf_keyword_offset');
+      const kwCount = localStorage.getItem('pdf_keyword_count');
+      const kwSep = localStorage.getItem('pdf_keyword_sep') as KeywordLineSeparator | null;
       const scan = localStorage.getItem('pdf_scan_mode') as ScanMode | null;
 
       if (mode) setExtractMode(mode);
       if (input !== null) setTargetInput(input);
       if (kwInput !== null) setTargetKeywordsInput(kwInput);
+      if (kwTarget === 'smart' || kwTarget === 'next_line' || kwTarget === 'same_line') {
+        setKeywordTarget(kwTarget);
+      }
+      if (kwOffset !== null) {
+        const parsedOffset = parseInt(kwOffset, 10);
+        if (!isNaN(parsedOffset) && parsedOffset >= 1) {
+          setKeywordLineOffset(parsedOffset);
+        }
+      }
+      if (kwCount !== null) {
+        const parsedCount = parseInt(kwCount, 10);
+        if (!isNaN(parsedCount) && parsedCount >= 1) {
+          setKeywordLineCount(parsedCount);
+        }
+      }
+      if (kwSep === 'newline' || kwSep === 'space' || kwSep === 'pipe') {
+        setKeywordLineSeparator(kwSep);
+      }
       if (scan) setScanMode(scan);
     } catch (e) {
       console.warn('LocalStorage unavailable:', e);
     }
+
+    // Restore saved files from persistent storage
+    loadFilesFromDB().then((savedFiles) => {
+      if (savedFiles && savedFiles.length > 0) {
+        setSelectedFiles(savedFiles);
+      }
+    });
+
+    // Restore saved extracted results across refreshes
+    loadExtractedDataFromDB().then((savedResult) => {
+      if (savedResult && savedResult.data && savedResult.data.length > 0) {
+        setExtractedData(savedResult.data);
+        setHasReport(true);
+        if (savedResult.processingTimeSec) {
+          setProcessingTimeSec(savedResult.processingTimeSec);
+          setStatusMessage(`Restored previous session (${savedResult.data.length} records preserved)`);
+        }
+      }
+    });
   }, []);
 
   // Save preferences
-  const savePreferences = (mode: ExtractMode, input: string, scan: ScanMode, kwInput?: string) => {
+  const savePreferences = (
+    mode: ExtractMode,
+    input: string,
+    scan: ScanMode,
+    kwInput?: string,
+    kwTarget?: KeywordMatchTarget,
+    kwOffset?: number,
+    kwCount?: number,
+    kwSep?: KeywordLineSeparator
+  ) => {
     try {
       localStorage.setItem('pdf_extract_mode', mode);
       localStorage.setItem('pdf_target_input', input);
       if (kwInput !== undefined) {
         localStorage.setItem('pdf_target_keywords', kwInput);
+      }
+      if (kwTarget !== undefined) {
+        localStorage.setItem('pdf_keyword_target', kwTarget);
+      }
+      if (kwOffset !== undefined) {
+        localStorage.setItem('pdf_keyword_offset', String(kwOffset));
+      }
+      if (kwCount !== undefined) {
+        localStorage.setItem('pdf_keyword_count', String(kwCount));
+      }
+      if (kwSep !== undefined) {
+        localStorage.setItem('pdf_keyword_sep', kwSep);
       }
       localStorage.setItem('pdf_scan_mode', scan);
     } catch (e) {
@@ -107,16 +185,31 @@ export default function App() {
     setSelectedFiles((prev) => {
       const existingKeys = new Set(prev.map((f) => `${f.name}-${f.size}`));
       const newFiles = files.filter((f) => !existingKeys.has(`${f.name}-${f.size}`));
-      return [...prev, ...newFiles];
+      const updated = [...prev, ...newFiles];
+      saveFilesToDB(updated);
+      return updated;
     });
   };
 
   const handleFileRemoved = (index: number) => {
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+    setSelectedFiles((prev) => {
+      const updated = prev.filter((_, i) => i !== index);
+      saveFilesToDB(updated);
+      return updated;
+    });
   };
 
   const handleClearAll = () => {
     setSelectedFiles([]);
+    clearFilesFromDB();
+  };
+
+  const handleClearExtractedData = () => {
+    setExtractedData([]);
+    setHasReport(false);
+    setProcessingTimeSec('');
+    setStatusMessage('');
+    clearExtractedDataFromDB();
   };
 
   const abortProcessing = () => {
@@ -133,18 +226,26 @@ export default function App() {
     }
 
     const rawInput = targetInput.trim();
-    if (!rawInput && extractMode !== 'combined') {
+    if (!rawInput && extractMode !== 'combined' && extractMode !== 'tables') {
       alert('Please specify lines or keywords to extract.');
       return;
     }
 
-    savePreferences(extractMode, rawInput, scanMode, targetKeywordsInput);
+    savePreferences(
+      extractMode,
+      rawInput,
+      scanMode,
+      targetKeywordsInput,
+      keywordTarget,
+      keywordLineOffset,
+      keywordLineCount,
+      keywordLineSeparator
+    );
     isAbortedRef.current = false;
     setIsProcessing(true);
     setProgressPercent(0);
     setStatusMessage('Starting extraction engine...');
     setProcessingTimeSec('');
-    setExtractedData([]);
 
     const targetLines = (extractMode === 'line_numbers' || extractMode === 'combined') ? parseLineNumbers(rawInput) : [];
     const keywords =
@@ -154,95 +255,142 @@ export default function App() {
         ? targetKeywordsInput.split(',').map((k) => k.trim()).filter(Boolean)
         : [];
 
-    const results: ExtractedRow[] = [];
     const totalFiles = filesToUse.length;
+    const resultsByFile: ExtractedRow[][] = new Array(totalFiles).fill(null).map(() => []);
     let completedCount = 0;
     const startTime = performance.now();
 
     const CONCURRENCY_LIMIT = Math.max(4, (navigator.hardwareConcurrency || 4) * 2);
+    const workerCount = Math.min(CONCURRENCY_LIMIT, totalFiles);
 
-    async function worker(file: File) {
+    async function processSingleFile(file: File, targetRows: ExtractedRow[]) {
       if (isAbortedRef.current) return;
       try {
-        const lines = await extractFastLines(file, scanMode);
+        const fileSourceUrl = (file as any).sourceUrl || (file as any).url || '';
 
-        if (extractMode === 'line_numbers') {
-          const rowResult: ExtractedRow = { 'File Name': file.name };
-          targetLines.forEach((lineNum) => {
-            rowResult[`Line ${lineNum}`] =
-              lines[lineNum - 1] !== undefined ? lines[lineNum - 1] : '[Not Found]';
-          });
-          rowResult['Total Lines'] = lines.length;
-          results.push(rowResult);
-        } else if (extractMode === 'keywords') {
-          keywords.forEach((kw) => {
-            const matches = findAllKeywordMatches(lines, kw);
-            if (matches.length > 0) {
-              matches.forEach((matchValue, occurrenceIdx) => {
-                results.push({
+        if (extractMode === 'tables') {
+          const tableRows = await extractTablesFromPDF(file, scanMode);
+          if (tableRows.length > 0) {
+            targetRows.push(...tableRows);
+          } else {
+            targetRows.push({
+              'File Name': file.name,
+              'File URL / Link': fileSourceUrl || '-',
+              'Status': 'No structured tables detected',
+            });
+          }
+        } else {
+          const { lines, links } = await extractFastLines(file, scanMode);
+          const linkString = fileSourceUrl || (links.length > 0 ? links.join(' | ') : '-');
+
+          if (extractMode === 'line_numbers') {
+            const rowResult: ExtractedRow = {
+              'File Name': file.name,
+              'File URL / Link': linkString,
+            };
+            targetLines.forEach((lineNum) => {
+              rowResult[`Line ${lineNum}`] =
+                lines[lineNum - 1] !== undefined ? lines[lineNum - 1] : '[Not Found]';
+            });
+            rowResult['Total Lines'] = lines.length;
+            targetRows.push(rowResult);
+          } else if (extractMode === 'keywords') {
+            keywords.forEach((kw) => {
+              const matches = findAllKeywordMatches(
+                lines,
+                kw,
+                keywordTarget,
+                keywordLineOffset,
+                keywordLineCount,
+                keywordLineSeparator
+              );
+              if (matches.length > 0) {
+                matches.forEach((matchValue, occurrenceIdx) => {
+                  targetRows.push({
+                    'File Name': file.name,
+                    'File URL / Link': linkString,
+                    'Keyword': kw,
+                    'Occurrence': occurrenceIdx + 1,
+                    'Extracted Value': matchValue,
+                    'Total Lines': lines.length,
+                  });
+                });
+              } else {
+                targetRows.push({
                   'File Name': file.name,
+                  'File URL / Link': linkString,
                   'Keyword': kw,
-                  'Occurrence': occurrenceIdx + 1,
-                  'Extracted Value': matchValue,
+                  'Occurrence': 0,
+                  'Extracted Value': '[Not Found]',
                   'Total Lines': lines.length,
                 });
-              });
-            } else {
-              results.push({
-                'File Name': file.name,
-                'Keyword': kw,
-                'Occurrence': 0,
-                'Extracted Value': '[Not Found]',
-                'Total Lines': lines.length,
-              });
-            }
-          });
-        } else if (extractMode === 'combined') {
-          // Combined Mode: Unified Row per File containing Line Numbers + Keywords!
-          const rowResult: ExtractedRow = { 'File Name': file.name };
+              }
+            });
+          } else if (extractMode === 'combined') {
+            // Combined Mode: Unified Row per File containing Line Numbers + Keywords!
+            const rowResult: ExtractedRow = {
+              'File Name': file.name,
+              'File URL / Link': linkString,
+            };
 
-          // 1. Line numbers extraction
-          targetLines.forEach((lineNum) => {
-            rowResult[`Line ${lineNum}`] =
-              lines[lineNum - 1] !== undefined ? lines[lineNum - 1] : '[Not Found]';
-          });
+            // 1. Line numbers extraction
+            targetLines.forEach((lineNum) => {
+              rowResult[`Line ${lineNum}`] =
+                lines[lineNum - 1] !== undefined ? lines[lineNum - 1] : '[Not Found]';
+            });
 
-          // 2. Keywords extraction
-          keywords.forEach((kw) => {
-            const matches = findAllKeywordMatches(lines, kw);
-            rowResult[`KW: ${kw}`] = matches.length > 0 ? matches.join(' | ') : '[Not Found]';
-          });
+            // 2. Keywords extraction
+            keywords.forEach((kw) => {
+              const matches = findAllKeywordMatches(
+                lines,
+                kw,
+                keywordTarget,
+                keywordLineOffset,
+                keywordLineCount,
+                keywordLineSeparator
+              );
+              rowResult[`KW: ${kw}`] = matches.length > 0 ? matches.join(' | ') : '[Not Found]';
+            });
 
-          rowResult['Total Lines'] = lines.length;
-          results.push(rowResult);
+            rowResult['Total Lines'] = lines.length;
+            targetRows.push(rowResult);
+          }
         }
       } catch (err: any) {
         const errDetail = err?.message || String(err);
         console.error('File Read Error:', file.name, err);
-        results.push({
+        targetRows.push({
           'File Name': file.name,
+          'File URL / Link': (file as any).sourceUrl || '-',
           'Error': `[File Read Error: ${errDetail}]`,
         });
       } finally {
         completedCount++;
         const percent = Math.round((completedCount / totalFiles) * 100);
         setProgressPercent(percent);
-        setStatusMessage(`Processing: ${completedCount}/${totalFiles} files (${percent}%)`);
+        setStatusMessage(`Processing (${workerCount}x parallel): ${completedCount}/${totalFiles} files (${percent}%)`);
       }
     }
 
-    for (let i = 0; i < totalFiles; i += CONCURRENCY_LIMIT) {
-      if (isAbortedRef.current) break;
-      const chunk = filesToUse.slice(i, i + CONCURRENCY_LIMIT);
-      await Promise.all(chunk.map((file) => worker(file)));
+    let nextFileIndex = 0;
+    async function workerLoop() {
+      while (!isAbortedRef.current) {
+        const idx = nextFileIndex++;
+        if (idx >= totalFiles) break;
+        await processSingleFile(filesToUse[idx], resultsByFile[idx]);
+      }
     }
 
+    await Promise.all(Array.from({ length: workerCount }, () => workerLoop()));
+
     if (!isAbortedRef.current) {
+      const results = resultsByFile.flat();
       const timeInSeconds = ((performance.now() - startTime) / 1000).toFixed(2);
       setProcessingTimeSec(timeInSeconds);
       setStatusMessage(`Completed in ${timeInSeconds}s! Downloading Excel report...`);
       setExtractedData(results);
       setHasReport(true);
+      await saveExtractedDataToDB(results, timeInSeconds);
       exportToXLSX(results, 'PDF_Report');
     }
 
@@ -296,6 +444,17 @@ export default function App() {
               </span>
             </div>
 
+            {/* User Guide Modal Trigger Button */}
+            <button
+              type="button"
+              onClick={() => setIsUserGuideOpen(true)}
+              className="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition-colors flex items-center gap-1.5 text-xs font-bold cursor-pointer shadow-sm shadow-blue-500/20"
+              title="عرض دليل الاستخدام (User Guide)"
+            >
+              <FileText className="w-4 h-4" />
+              <span className="hidden md:inline">دليل الاستخدام</span>
+            </button>
+
             {/* Theme Toggle Button */}
             <button
               type="button"
@@ -335,22 +494,42 @@ export default function App() {
               extractMode={extractMode}
               onExtractModeChange={(m) => {
                 setExtractMode(m);
-                savePreferences(m, targetInput, scanMode, targetKeywordsInput);
+                savePreferences(m, targetInput, scanMode, targetKeywordsInput, keywordTarget, keywordLineOffset, keywordLineCount, keywordLineSeparator);
               }}
               targetInput={targetInput}
               onTargetInputChange={(val) => {
                 setTargetInput(val);
-                savePreferences(extractMode, val, scanMode, targetKeywordsInput);
+                savePreferences(extractMode, val, scanMode, targetKeywordsInput, keywordTarget, keywordLineOffset, keywordLineCount, keywordLineSeparator);
               }}
               targetKeywordsInput={targetKeywordsInput}
               onTargetKeywordsInputChange={(val) => {
                 setTargetKeywordsInput(val);
-                savePreferences(extractMode, targetInput, scanMode, val);
+                savePreferences(extractMode, targetInput, scanMode, val, keywordTarget, keywordLineOffset, keywordLineCount, keywordLineSeparator);
+              }}
+              keywordTarget={keywordTarget}
+              onKeywordTargetChange={(kt) => {
+                setKeywordTarget(kt);
+                savePreferences(extractMode, targetInput, scanMode, targetKeywordsInput, kt, keywordLineOffset, keywordLineCount, keywordLineSeparator);
+              }}
+              keywordLineOffset={keywordLineOffset}
+              onKeywordLineOffsetChange={(offset) => {
+                setKeywordLineOffset(offset);
+                savePreferences(extractMode, targetInput, scanMode, targetKeywordsInput, keywordTarget, offset, keywordLineCount, keywordLineSeparator);
+              }}
+              keywordLineCount={keywordLineCount}
+              onKeywordLineCountChange={(cnt) => {
+                setKeywordLineCount(cnt);
+                savePreferences(extractMode, targetInput, scanMode, targetKeywordsInput, keywordTarget, keywordLineOffset, cnt, keywordLineSeparator);
+              }}
+              keywordLineSeparator={keywordLineSeparator}
+              onKeywordLineSeparatorChange={(sep) => {
+                setKeywordLineSeparator(sep);
+                savePreferences(extractMode, targetInput, scanMode, targetKeywordsInput, keywordTarget, keywordLineOffset, keywordLineCount, sep);
               }}
               scanMode={scanMode}
               onScanModeChange={(s) => {
                 setScanMode(s);
-                savePreferences(extractMode, targetInput, s, targetKeywordsInput);
+                savePreferences(extractMode, targetInput, s, targetKeywordsInput, keywordTarget, keywordLineOffset, keywordLineCount, keywordLineSeparator);
               }}
               disabled={isProcessing}
             />
@@ -381,6 +560,7 @@ export default function App() {
                         updated.push(file);
                       }
                     });
+                    saveFilesToDB(updated);
                     setTimeout(() => processPDFs(updated), 50);
                     return updated;
                   });
@@ -485,10 +665,7 @@ export default function App() {
             <ResultsTable
               data={extractedData}
               onDownload={handleRedownload}
-              onClear={() => {
-                setExtractedData([]);
-                setHasReport(false);
-              }}
+              onClear={handleClearExtractedData}
               processingTimeSec={processingTimeSec}
               defaultExpanded={false}
             />
@@ -511,6 +688,12 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* User Guide Modal Dialog */}
+      <UserGuideModal
+        isOpen={isUserGuideOpen}
+        onClose={() => setIsUserGuideOpen(false)}
+      />
     </div>
   );
 }

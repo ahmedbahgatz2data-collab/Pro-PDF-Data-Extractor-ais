@@ -1,24 +1,27 @@
-export type ExtractMode = 'line_numbers' | 'keywords' | 'combined';
+export type ExtractMode = 'line_numbers' | 'keywords' | 'combined' | 'tables';
 export type ScanMode = 'first_page' | 'all_pages';
+export type KeywordMatchTarget = 'smart' | 'next_line' | 'same_line';
+export type KeywordLineSeparator = 'newline' | 'space' | 'pipe';
 
 export interface ExtractedRow {
-  [key: string]: string | number;
+  'File Name': string;
+  'File URL / Link'?: string;
+  [key: string]: string | number | undefined;
 }
 
-export interface ExtractedKeywordRow {
+export interface ExtractedKeywordRow extends ExtractedRow {
   'File Name': string;
+  'File URL / Link'?: string;
   'Keyword': string;
   'Occurrence': number;
   'Extracted Value': string;
   'Total Lines': number;
-  [key: string]: string | number;
 }
 
-export interface ExtractedLineRow {
+export interface ExtractedLineRow extends ExtractedRow {
   'File Name': string;
+  'File URL / Link'?: string;
   'Total Lines': number;
-  [key: `Line ${number}`]: string;
-  [key: string]: string | number;
 }
 
 export interface ProcessingStats {
@@ -26,3 +29,4 @@ export interface ProcessingStats {
   completedCount: number;
   timeTakenSec: string;
 }
+
