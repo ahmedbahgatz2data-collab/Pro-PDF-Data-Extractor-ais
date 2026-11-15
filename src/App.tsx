@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ExtractMode, ScanMode, ExtractedRow, KeywordMatchTarget, KeywordLineSeparator } from './types';
+import {
+  ExtractMode,
+  ScanMode,
+  ExtractedRow,
+  KeywordMatchTarget,
+  KeywordLineSeparator,
+  QueuedFileMeta,
+} from './types';
 import { DropZone } from './components/DropZone';
 import { ExtractionSettings } from './components/ExtractionSettings';
 import { ResultsTable } from './components/ResultsTable';
@@ -9,12 +16,14 @@ import {
   parseLineNumbers,
   findAllKeywordMatches,
   exportToXLSX,
+  createPdfWorker,
 } from './utils/pdfExtractor';
-import { generateUserGuidePDF } from './utils/generateUserGuidePDF';
 import { UserGuideModal } from './components/UserGuideModal';
 import {
-  saveFilesToDB,
-  loadFilesFromDB,
+  loadFileMetasFromDB,
+  loadSingleFileFromDB,
+  putSingleFileToDB,
+  removeFileFromDB,
   clearFilesFromDB,
   saveExtractedDataToDB,
   loadExtractedDataFromDB,
@@ -38,7 +47,7 @@ import {
 } from 'lucide-react';
 
 export default function App() {
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [queuedFiles, setQueuedFiles] = useState<QueuedFileMeta[]>([]);
   const [extractMode, setExtractMode] = useState<ExtractMode>('line_numbers');
   const [targetInput, setTargetInput] = useState<string>('');
   const [targetKeywordsInput, setTargetKeywordsInput] = useState<string>('');
@@ -103,7 +112,12 @@ export default function App() {
       if (mode) setExtractMode(mode);
       if (input !== null) setTargetInput(input);
       if (kwInput !== null) setTargetKeywordsInput(kwInput);
-      if (kwTarget === 'smart' || kwTarget === 'next_line' || kwTarget === 'same_line') {
+      if (
+        kwTarget === 'smart' ||
+        kwTarget === 'next_line' ||
+        kwTarget === 'prev_line' ||
+        kwTarget === 'same_line'
+      ) {
         setKeywordTarget(kwTarget);
       }
       if (kwOffset !== null) {
@@ -126,10 +140,10 @@ export default function App() {
       console.warn('LocalStorage unavailable:', e);
     }
 
-    // Restore saved files from persistent storage
-    loadFilesFromDB().then((savedFiles) => {
-      if (savedFiles && savedFiles.length > 0) {
-        setSelectedFiles(savedFiles);
+    // Restore lightweight file metadata from IndexedDB (0 Blobs loaded into RAM)
+    loadFileMetasFromDB().then((savedMetas) => {
+      if (savedMetas && savedMetas.length > 0) {
+        setQueuedFiles(savedMetas);
       }
     });
 
@@ -181,26 +195,22 @@ export default function App() {
     }
   };
 
-  const handleFilesAdded = (files: File[]) => {
-    setSelectedFiles((prev) => {
-      const existingKeys = new Set(prev.map((f) => `${f.name}-${f.size}`));
-      const newFiles = files.filter((f) => !existingKeys.has(`${f.name}-${f.size}`));
-      const updated = [...prev, ...newFiles];
-      saveFilesToDB(updated);
-      return updated;
+  const handleFilesAdded = (newMetas: QueuedFileMeta[]) => {
+    setQueuedFiles((prev) => {
+      const existingIds = new Set(prev.map((m) => m.id));
+      const uniqueNew = newMetas.filter((m) => !existingIds.has(m.id));
+      if (uniqueNew.length === 0) return prev;
+      return [...prev, ...uniqueNew];
     });
   };
 
-  const handleFileRemoved = (index: number) => {
-    setSelectedFiles((prev) => {
-      const updated = prev.filter((_, i) => i !== index);
-      saveFilesToDB(updated);
-      return updated;
-    });
+  const handleFileRemoved = (fileId: string) => {
+    setQueuedFiles((prev) => prev.filter((m) => m.id !== fileId));
+    removeFileFromDB(fileId);
   };
 
   const handleClearAll = () => {
-    setSelectedFiles([]);
+    setQueuedFiles([]);
     clearFilesFromDB();
   };
 
@@ -218,9 +228,10 @@ export default function App() {
     setIsProcessing(false);
   };
 
-  const processPDFs = async (overrideFiles?: File[]) => {
-    const filesToUse = Array.isArray(overrideFiles) && overrideFiles.length > 0 ? overrideFiles : selectedFiles;
-    if (!filesToUse || filesToUse.length === 0) {
+  const processPDFs = async (overrideMetas?: QueuedFileMeta[]) => {
+    const metasToUse =
+      Array.isArray(overrideMetas) && overrideMetas.length > 0 ? overrideMetas : queuedFiles;
+    if (!metasToUse || metasToUse.length === 0) {
       alert('Please select at least one PDF file.');
       return;
     }
@@ -244,7 +255,7 @@ export default function App() {
     isAbortedRef.current = false;
     setIsProcessing(true);
     setProgressPercent(0);
-    setStatusMessage('Starting extraction engine...');
+    setStatusMessage('Starting memory-optimized extraction engine...');
     setProcessingTimeSec('');
 
     const targetLines = (extractMode === 'line_numbers' || extractMode === 'combined') ? parseLineNumbers(rawInput) : [];
@@ -255,37 +266,62 @@ export default function App() {
         ? targetKeywordsInput.split(',').map((k) => k.trim()).filter(Boolean)
         : [];
 
-    const totalFiles = filesToUse.length;
+    const totalFiles = metasToUse.length;
     const resultsByFile: ExtractedRow[][] = new Array(totalFiles).fill(null).map(() => []);
     let completedCount = 0;
     const startTime = performance.now();
 
-    const CONCURRENCY_LIMIT = Math.max(4, (navigator.hardwareConcurrency || 4) * 2);
+    // Reusable PDFWorker pool + disableFontFace lets us run 3-6 parallel workers with low RAM & zero worker respawn overhead
+    const CONCURRENCY_LIMIT = Math.min(6, Math.max(3, navigator.hardwareConcurrency || 4));
     const workerCount = Math.min(CONCURRENCY_LIMIT, totalFiles);
+    let lastProgressPaint = 0;
 
-    async function processSingleFile(file: File, targetRows: ExtractedRow[]) {
+    async function processSingleFile(
+      meta: QueuedFileMeta,
+      targetRows: ExtractedRow[],
+      sharedWorker?: ReturnType<typeof createPdfWorker>
+    ) {
       if (isAbortedRef.current) return;
+      let file: File | null = null;
       try {
-        const fileSourceUrl = (file as any).sourceUrl || (file as any).url || '';
+        // Fetch ONLY this single Blob from IndexedDB right when needed
+        file = await loadSingleFileFromDB(meta);
+
+        // Fallback: if Blob was evicted from storage and sourceUrl exists, fetch on-demand
+        if (!file && meta.sourceUrl) {
+          const resp = await fetch(`/api/proxy-pdf?url=${encodeURIComponent(meta.sourceUrl)}`);
+          if (resp.ok) {
+            const blob = await resp.blob();
+            file = new File([blob], meta.name, { type: 'application/pdf' });
+            (file as any).sourceUrl = meta.sourceUrl;
+            await putSingleFileToDB(file);
+          }
+        }
+
+        if (!file) {
+          throw new Error('File Blob not found in local IndexedDB storage');
+        }
+
+        const fileSourceUrl = meta.sourceUrl || (file as any).sourceUrl || (file as any).url || '';
 
         if (extractMode === 'tables') {
-          const tableRows = await extractTablesFromPDF(file, scanMode);
+          const tableRows = await extractTablesFromPDF(file, scanMode, sharedWorker);
           if (tableRows.length > 0) {
             targetRows.push(...tableRows);
           } else {
             targetRows.push({
-              'File Name': file.name,
+              'File Name': meta.name,
               'File URL / Link': fileSourceUrl || '-',
               'Status': 'No structured tables detected',
             });
           }
         } else {
-          const { lines, links } = await extractFastLines(file, scanMode);
+          const { lines, links } = await extractFastLines(file, scanMode, sharedWorker);
           const linkString = fileSourceUrl || (links.length > 0 ? links.join(' | ') : '-');
 
           if (extractMode === 'line_numbers') {
             const rowResult: ExtractedRow = {
-              'File Name': file.name,
+              'File Name': meta.name,
               'File URL / Link': linkString,
             };
             targetLines.forEach((lineNum) => {
@@ -307,7 +343,7 @@ export default function App() {
               if (matches.length > 0) {
                 matches.forEach((matchValue, occurrenceIdx) => {
                   targetRows.push({
-                    'File Name': file.name,
+                    'File Name': meta.name,
                     'File URL / Link': linkString,
                     'Keyword': kw,
                     'Occurrence': occurrenceIdx + 1,
@@ -317,7 +353,7 @@ export default function App() {
                 });
               } else {
                 targetRows.push({
-                  'File Name': file.name,
+                  'File Name': meta.name,
                   'File URL / Link': linkString,
                   'Keyword': kw,
                   'Occurrence': 0,
@@ -329,7 +365,7 @@ export default function App() {
           } else if (extractMode === 'combined') {
             // Combined Mode: Unified Row per File containing Line Numbers + Keywords!
             const rowResult: ExtractedRow = {
-              'File Name': file.name,
+              'File Name': meta.name,
               'File URL / Link': linkString,
             };
 
@@ -358,26 +394,41 @@ export default function App() {
         }
       } catch (err: any) {
         const errDetail = err?.message || String(err);
-        console.error('File Read Error:', file.name, err);
+        console.error('File Read Error:', meta.name, err);
         targetRows.push({
-          'File Name': file.name,
-          'File URL / Link': (file as any).sourceUrl || '-',
+          'File Name': meta.name,
+          'File URL / Link': meta.sourceUrl || '-',
           'Error': `[File Read Error: ${errDetail}]`,
         });
       } finally {
+        // Release File/Blob reference immediately so GC can reclaim RAM
+        file = null;
         completedCount++;
-        const percent = Math.round((completedCount / totalFiles) * 100);
-        setProgressPercent(percent);
-        setStatusMessage(`Processing (${workerCount}x parallel): ${completedCount}/${totalFiles} files (${percent}%)`);
+        const now = performance.now();
+        if (completedCount === totalFiles || now - lastProgressPaint >= 80) {
+          lastProgressPaint = now;
+          const percent = Math.round((completedCount / totalFiles) * 100);
+          setProgressPercent(percent);
+          setStatusMessage(`Processing (${workerCount}x parallel): ${completedCount}/${totalFiles} files (${percent}%)`);
+        }
       }
     }
 
     let nextFileIndex = 0;
     async function workerLoop() {
-      while (!isAbortedRef.current) {
-        const idx = nextFileIndex++;
-        if (idx >= totalFiles) break;
-        await processSingleFile(filesToUse[idx], resultsByFile[idx]);
+      const sharedWorker = createPdfWorker();
+      try {
+        while (!isAbortedRef.current) {
+          const idx = nextFileIndex++;
+          if (idx >= totalFiles) break;
+          await processSingleFile(metasToUse[idx], resultsByFile[idx], sharedWorker);
+        }
+      } finally {
+        try {
+          sharedWorker?.destroy();
+        } catch {
+          // ignore worker destroy errors
+        }
       }
     }
 
@@ -386,12 +437,13 @@ export default function App() {
     if (!isAbortedRef.current) {
       const results = resultsByFile.flat();
       const timeInSeconds = ((performance.now() - startTime) / 1000).toFixed(2);
+      setProgressPercent(100);
       setProcessingTimeSec(timeInSeconds);
       setStatusMessage(`Completed in ${timeInSeconds}s! Downloading Excel report...`);
       setExtractedData(results);
       setHasReport(true);
-      await saveExtractedDataToDB(results, timeInSeconds);
       exportToXLSX(results, 'PDF_Report');
+      await saveExtractedDataToDB(results, timeInSeconds);
     }
 
     setIsProcessing(false);
@@ -405,7 +457,7 @@ export default function App() {
     }
   };
 
-  const workerThreads = Math.max(4, (navigator.hardwareConcurrency || 4) * 2);
+  const workerThreads = Math.min(6, Math.max(3, navigator.hardwareConcurrency || 4));
 
   return (
     <div className="min-h-screen bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col font-sans selection:bg-blue-200 dark:selection:bg-blue-800 transition-colors duration-200">
@@ -550,17 +602,18 @@ export default function App() {
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-xs space-y-6">
               {/* Drop Zone */}
               <DropZone
-                files={selectedFiles}
+                files={queuedFiles}
                 onFilesAdded={handleFilesAdded}
-                onFilesAddedAndExtractDirectly={(newFiles) => {
-                  setSelectedFiles((prev) => {
+                onFilesAddedAndExtractDirectly={(newMetas) => {
+                  setQueuedFiles((prev) => {
+                    const existingIds = new Set(prev.map((m) => m.id));
                     const updated = [...prev];
-                    newFiles.forEach((file) => {
-                      if (!updated.some((f) => f.name === file.name && f.size === file.size)) {
-                        updated.push(file);
+                    newMetas.forEach((meta) => {
+                      if (!existingIds.has(meta.id)) {
+                        updated.push(meta);
+                        existingIds.add(meta.id);
                       }
                     });
-                    saveFilesToDB(updated);
                     setTimeout(() => processPDFs(updated), 50);
                     return updated;
                   });
@@ -575,9 +628,9 @@ export default function App() {
                 <button
                   id="btnSubmit"
                   onClick={() => processPDFs()}
-                  disabled={isProcessing || selectedFiles.length === 0}
+                  disabled={isProcessing || queuedFiles.length === 0}
                   className={`flex-1 flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl font-bold text-sm text-white shadow-md transition-all cursor-pointer ${
-                    isProcessing || selectedFiles.length === 0
+                    isProcessing || queuedFiles.length === 0
                       ? 'bg-slate-300 dark:bg-slate-800 text-slate-500 dark:text-slate-600 cursor-not-allowed shadow-none'
                       : 'bg-blue-600 hover:bg-blue-700 active:scale-[0.99] shadow-blue-500/25'
                   }`}
@@ -606,7 +659,7 @@ export default function App() {
                   </button>
                 )}
 
-                {selectedFiles.length > 0 && !isProcessing && (
+                {queuedFiles.length > 0 && !isProcessing && (
                   <button
                     onClick={handleClearAll}
                     className="px-4 py-3.5 bg-slate-800 hover:bg-slate-900 dark:bg-slate-700 dark:hover:bg-slate-600 text-white rounded-xl font-semibold text-sm transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"

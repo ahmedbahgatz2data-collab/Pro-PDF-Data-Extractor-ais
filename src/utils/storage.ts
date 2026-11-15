@@ -1,11 +1,18 @@
-// IndexedDB utility for persistent storage of Files and Extracted Data
+import { QueuedFileMeta } from '../types';
+
+// IndexedDB utility for persistent storage of Files (Blobs separated from Metadata) and Extracted Data
 const DB_NAME = 'pdf_extractor_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_FILES = 'saved_files';
+const STORE_FILE_METAS = 'saved_file_metas';
 const STORE_RESULTS = 'saved_results';
 
+let dbPromise: Promise<IDBDatabase> | null = null;
+
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onupgradeneeded = (event) => {
@@ -13,17 +20,31 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_FILES)) {
         db.createObjectStore(STORE_FILES, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(STORE_FILE_METAS)) {
+        db.createObjectStore(STORE_FILE_METAS, { keyPath: 'id' });
+      }
       if (!db.objectStoreNames.contains(STORE_RESULTS)) {
         db.createObjectStore(STORE_RESULTS, { keyPath: 'id' });
       }
     };
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      dbPromise = null;
+      reject(request.error);
+    };
   });
+
+  return dbPromise;
 }
 
-export interface StoredFileRecord {
+export interface StoredFileBlobRecord {
   id: string;
   name: string;
   size: number;
@@ -33,91 +54,189 @@ export interface StoredFileRecord {
   blob: Blob;
 }
 
+export interface StoredFileMetaRecord extends QueuedFileMeta {
+  order: number;
+}
+
+export function buildFileMetaId(name: string, size: number, sourceUrl?: string): string {
+  const cleanUrl = (sourceUrl || '').trim();
+  return cleanUrl ? `${name}::${size}::${cleanUrl}` : `${name}::${size}`;
+}
+
 /**
- * Save array of File objects to IndexedDB
+ * Save a single File/Blob incrementally to IndexedDB without rewriting existing files,
+ * and return lightweight metadata (zero Blob kept in React RAM).
  */
-export async function saveFilesToDB(files: File[]): Promise<void> {
+export async function putSingleFileToDB(file: File, orderHint?: number): Promise<QueuedFileMeta> {
+  const sourceUrl = ((file as any).sourceUrl || (file as any).url || '').trim();
+  const id = buildFileMetaId(file.name, file.size, sourceUrl);
+  const meta: StoredFileMetaRecord = {
+    id,
+    name: file.name,
+    size: file.size,
+    type: file.type || 'application/pdf',
+    lastModified: file.lastModified || Date.now(),
+    ...(sourceUrl ? { sourceUrl } : {}),
+    order: orderHint ?? Date.now() + Math.random(),
+  };
+
   try {
     const db = await openDB();
-    const tx = db.transaction(STORE_FILES, 'readwrite');
-    const store = tx.objectStore(STORE_FILES);
+    const tx = db.transaction([STORE_FILE_METAS, STORE_FILES], 'readwrite');
+    const metaStore = tx.objectStore(STORE_FILE_METAS);
+    const fileStore = tx.objectStore(STORE_FILES);
 
-    // Clear old files and insert current ones
-    await new Promise<void>((resolve, reject) => {
-      const clearReq = store.clear();
-      clearReq.onsuccess = () => resolve();
-      clearReq.onerror = () => reject(clearReq.error);
-    });
-
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      const sourceUrl = (f as any).sourceUrl || (f as any).url || '';
-      const record: StoredFileRecord = {
-        id: `${f.name}_${f.size}_${i}`,
-        name: f.name,
-        size: f.size,
-        type: f.type || 'application/pdf',
-        lastModified: f.lastModified || Date.now(),
-        sourceUrl,
-        blob: f,
-      };
-      store.put(record);
-    }
+    metaStore.put(meta);
+    fileStore.put({
+      id,
+      name: meta.name,
+      size: meta.size,
+      type: meta.type,
+      lastModified: meta.lastModified,
+      ...(sourceUrl ? { sourceUrl } : {}),
+      blob: file,
+    } as StoredFileBlobRecord);
 
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    console.warn('Failed to save files to IndexedDB:', err);
+    console.warn('Failed to save file to IndexedDB:', err);
   }
+
+  return {
+    id: meta.id,
+    name: meta.name,
+    size: meta.size,
+    type: meta.type,
+    lastModified: meta.lastModified,
+    ...(meta.sourceUrl ? { sourceUrl: meta.sourceUrl } : {}),
+  };
 }
 
 /**
- * Load array of File objects from IndexedDB
+ * Load ONLY lightweight file metadata from IndexedDB (zero Blobs loaded into RAM!).
+ * Automatically migrates any legacy v1 records if needed.
  */
-export async function loadFilesFromDB(): Promise<File[]> {
+export async function loadFileMetasFromDB(): Promise<QueuedFileMeta[]> {
   try {
     const db = await openDB();
-    const tx = db.transaction(STORE_FILES, 'readonly');
-    const store = tx.objectStore(STORE_FILES);
+    const tx = db.transaction([STORE_FILE_METAS], 'readonly');
+    const metaStore = tx.objectStore(STORE_FILE_METAS);
 
-    return new Promise((resolve) => {
-      const req = store.getAll();
-      req.onsuccess = () => {
-        const records: StoredFileRecord[] = req.result || [];
-        const files: File[] = records.map((rec) => {
-          const file = new File([rec.blob], rec.name, {
-            type: rec.type,
-            lastModified: rec.lastModified,
-          });
-          if (rec.sourceUrl) {
-            (file as any).sourceUrl = rec.sourceUrl;
-          }
-          return file;
-        });
-        resolve(files);
-      };
-      req.onerror = () => {
-        console.warn('Failed to read files from IndexedDB:', req.error);
-        resolve([]);
-      };
+    const metas = await new Promise<StoredFileMetaRecord[]>((resolve) => {
+      const req = metaStore.getAll();
+      req.onsuccess = () => resolve((req.result as StoredFileMetaRecord[]) || []);
+      req.onerror = () => resolve([]);
     });
+
+    if (metas.length > 0) {
+      metas.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      return metas.map(({ order: _order, ...rest }) => rest);
+    }
+
+    // Check legacy v1 store via cursor (one by one) if meta store is empty
+    const legacyTx = db.transaction([STORE_FILES, STORE_FILE_METAS], 'readwrite');
+    const legacyFileStore = legacyTx.objectStore(STORE_FILES);
+    const targetMetaStore = legacyTx.objectStore(STORE_FILE_METAS);
+    const migrated: QueuedFileMeta[] = [];
+
+    await new Promise<void>((resolve) => {
+      const cursorReq = legacyFileStore.openCursor();
+      let idx = 0;
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor) {
+          const rec = cursor.value as StoredFileBlobRecord;
+          const meta: StoredFileMetaRecord = {
+            id: rec.id,
+            name: rec.name,
+            size: rec.size,
+            type: rec.type || 'application/pdf',
+            lastModified: rec.lastModified || Date.now(),
+            ...(rec.sourceUrl ? { sourceUrl: rec.sourceUrl } : {}),
+            order: idx++,
+          };
+          targetMetaStore.put(meta);
+          const { order: _o, ...cleanMeta } = meta;
+          migrated.push(cleanMeta);
+          cursor.continue();
+        } else {
+          resolve();
+        }
+      };
+      cursorReq.onerror = () => resolve();
+    });
+
+    return migrated;
   } catch (err) {
-    console.warn('IndexedDB unavailable for loading files:', err);
+    console.warn('IndexedDB unavailable for loading file metadata:', err);
     return [];
   }
 }
 
 /**
- * Clear all files from IndexedDB
+ * Fetch a SINGLE File/Blob from IndexedDB on-demand right when a worker parses it.
+ */
+export async function loadSingleFileFromDB(meta: QueuedFileMeta): Promise<File | null> {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_FILES, 'readonly');
+    const store = tx.objectStore(STORE_FILES);
+
+    return await new Promise<File | null>((resolve) => {
+      const req = store.get(meta.id);
+      req.onsuccess = () => {
+        const rec = req.result as StoredFileBlobRecord | undefined;
+        if (!rec || !rec.blob) {
+          resolve(null);
+          return;
+        }
+        const file = new File([rec.blob], rec.name, {
+          type: rec.type || 'application/pdf',
+          lastModified: rec.lastModified || Date.now(),
+        });
+        if (rec.sourceUrl || meta.sourceUrl) {
+          (file as any).sourceUrl = rec.sourceUrl || meta.sourceUrl;
+        }
+        resolve(file);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch (err) {
+    console.warn('Failed to load single file from IndexedDB:', err);
+    return null;
+  }
+}
+
+/**
+ * Remove a single file by id from IndexedDB without touching other files
+ */
+export async function removeFileFromDB(id: string): Promise<void> {
+  try {
+    const db = await openDB();
+    const tx = db.transaction([STORE_FILE_METAS, STORE_FILES], 'readwrite');
+    tx.objectStore(STORE_FILE_METAS).delete(id);
+    tx.objectStore(STORE_FILES).delete(id);
+    await new Promise<void>((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch (err) {
+    console.warn('Failed to remove file from IndexedDB:', err);
+  }
+}
+
+/**
+ * Clear all files and metadata from IndexedDB
  */
 export async function clearFilesFromDB(): Promise<void> {
   try {
     const db = await openDB();
-    const tx = db.transaction(STORE_FILES, 'readwrite');
-    const store = tx.objectStore(STORE_FILES);
-    store.clear();
+    const tx = db.transaction([STORE_FILE_METAS, STORE_FILES], 'readwrite');
+    tx.objectStore(STORE_FILE_METAS).clear();
+    tx.objectStore(STORE_FILES).clear();
     await new Promise<void>((resolve) => {
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
@@ -128,14 +247,14 @@ export async function clearFilesFromDB(): Promise<void> {
 }
 
 /**
- * Save extracted data & report metadata
+ * Save extracted data & report metadata (large data stored strictly in IndexedDB)
  */
 export async function saveExtractedDataToDB(
   data: any[],
   processingTimeSec: string = ''
 ): Promise<void> {
   try {
-    // Save to LocalStorage as well for instant lightweight access
+    // Store only lightweight scalar stats in LocalStorage
     localStorage.setItem('pdf_saved_results_meta', JSON.stringify({
       count: data.length,
       processingTimeSec,
@@ -145,12 +264,6 @@ export async function saveExtractedDataToDB(
     const db = await openDB();
     const tx = db.transaction(STORE_RESULTS, 'readwrite');
     const store = tx.objectStore(STORE_RESULTS);
-
-    await new Promise<void>((resolve, reject) => {
-      const clearReq = store.clear();
-      clearReq.onsuccess = () => resolve();
-      clearReq.onerror = () => reject(clearReq.error);
-    });
 
     store.put({
       id: 'current_report',

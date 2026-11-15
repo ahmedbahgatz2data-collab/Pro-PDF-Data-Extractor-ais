@@ -155,6 +155,10 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                   ? keywordLineCount === 1
                     ? `Extracts line +${keywordLineOffset} after each keyword match.`
                     : `Extracts ${keywordLineCount} lines (+${keywordLineOffset} to +${endLineOffset}) after each keyword match.`
+                  : keywordTarget === 'prev_line'
+                  ? keywordLineCount === 1
+                    ? `Extracts line -${keywordLineOffset} before each keyword match.`
+                    : `Extracts ${keywordLineCount} lines (-${endLineOffset} to -${keywordLineOffset}) before each keyword match.`
                   : keywordTarget === 'same_line'
                   ? 'Extracts the entire line containing each keyword.'
                   : 'Extracts value after ":" / "=" or the next line for exact headings.'}
@@ -171,18 +175,26 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
             <CornerDownRight className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
             Keyword Output Target:
           </label>
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             {[
               { id: 'smart' as KeywordMatchTarget, label: 'Smart Auto', sub: 'After : or =' },
+              { id: 'same_line' as KeywordMatchTarget, label: 'Same Line', sub: 'Full matched line' },
               {
                 id: 'next_line' as KeywordMatchTarget,
                 label: 'Next Line(s)',
                 sub:
                   keywordLineCount === 1
-                    ? `Line +${keywordLineOffset}`
-                    : `${keywordLineCount} lines (+${keywordLineOffset}..+${endLineOffset})`,
+                    ? `Below (+${keywordLineOffset})`
+                    : `${keywordLineCount} below (+${keywordLineOffset}..+${endLineOffset})`,
               },
-              { id: 'same_line' as KeywordMatchTarget, label: 'Same Line', sub: 'Full line' },
+              {
+                id: 'prev_line' as KeywordMatchTarget,
+                label: 'Prev Line(s)',
+                sub:
+                  keywordLineCount === 1
+                    ? `Above (-${keywordLineOffset})`
+                    : `${keywordLineCount} above (-${endLineOffset}..-${keywordLineOffset})`,
+              },
             ].map((opt) => {
               const active = keywordTarget === opt.id;
               return (
@@ -206,7 +218,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
             })}
           </div>
 
-          {keywordTarget === 'next_line' && (
+          {(keywordTarget === 'next_line' || keywordTarget === 'prev_line') && (
             <div className="p-3 bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 rounded-xl space-y-2.5">
               {/* Number of lines to extract */}
               <div className="flex items-center justify-between gap-2">
@@ -239,16 +251,16 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                       const parsed = parseInt(e.target.value, 10);
                       onKeywordLineCountChange?.(isNaN(parsed) || parsed < 1 ? 1 : Math.min(50, parsed));
                     }}
-                    aria-label="Number of lines to extract after keyword"
+                    aria-label="Number of lines to extract relative to keyword"
                     className="w-12 px-1.5 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs text-center font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                   />
                 </div>
               </div>
 
-              {/* Start offset after keyword */}
+              {/* Start offset relative to keyword */}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-                  Start at line:
+                  {keywordTarget === 'prev_line' ? 'Lines before:' : 'Start at line:'}
                 </span>
                 <div className="flex items-center gap-1">
                   {[1, 2, 3].map((preset) => (
@@ -263,7 +275,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                           : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700'
                       }`}
                     >
-                      +{preset}
+                      {keywordTarget === 'prev_line' ? `-${preset}` : `+${preset}`}
                     </button>
                   ))}
                   <input
@@ -276,7 +288,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                       const parsed = parseInt(e.target.value, 10);
                       onKeywordLineOffsetChange?.(isNaN(parsed) || parsed < 1 ? 1 : Math.min(50, parsed));
                     }}
-                    aria-label="Start line offset after keyword"
+                    aria-label="Line offset relative to keyword"
                     className="w-12 px-1.5 py-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs text-center font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                   />
                 </div>
@@ -313,7 +325,11 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
               )}
 
               <div className="text-[10px] text-blue-700 dark:text-blue-300 font-medium">
-                {keywordLineCount === 1
+                {keywordTarget === 'prev_line'
+                  ? keywordLineCount === 1
+                    ? `Range: extracts line -${keywordLineOffset} before each keyword match.`
+                    : `Range: extracts ${keywordLineCount} lines (-${endLineOffset} to -${keywordLineOffset}) before each keyword match.`
+                  : keywordLineCount === 1
                   ? `Range: extracts line +${keywordLineOffset} after each keyword match.`
                   : `Range: extracts ${keywordLineCount} lines (+${keywordLineOffset} to +${endLineOffset}) after each keyword match.`}
               </div>

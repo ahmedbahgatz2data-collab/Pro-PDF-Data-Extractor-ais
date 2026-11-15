@@ -79,7 +79,7 @@ export function UserGuideModal({ isOpen, onClose }: UserGuideModalProps) {
               <span>البحث بالكلمات المفتاحية (Keywords Search)</span>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed pr-8">
-              ابحث عن كلمات مفتاحية مثل (<code className="bg-slate-800 px-1 py-0.5 rounded text-emerald-300">التاريخ، الإجمالي، رقم الفاتورة</code>)، مع إمكانية اختيار <b className="text-emerald-300">Next Line(s)</b> لاستخراج سطر واحد أو عدة أسطر متتالية بعد الكلمة المفتاحية (مع تحديد عدد الأسطر ونقطة البداية والفاصل)، أو استخراج القيمة على نفس السطر. يدعم النظام معالجة وتطبيع اللغة العربية بذكاء.
+              ابحث عن كلمات مفتاحية مثل (<code className="bg-slate-800 px-1 py-0.5 rounded text-emerald-300">التاريخ، الإجمالي، رقم الفاتورة</code>)، مع إمكانية اختيار <b className="text-emerald-300">Next Line(s)</b> لاستخراج سطر أو عدة أسطر بعد الكلمة المفتاحية، أو <b className="text-emerald-300">Prev Line(s)</b> لاستخراج أسطر قبل الكلمة المفتاحية (مع تحديد عدد الأسطر ونقطة البداية والفاصل). يدعم النظام معالجة وتطبيع اللغة العربية بذكاء.
             </p>
           </div>
 

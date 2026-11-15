@@ -1,4 +1,6 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
+import { QueuedFileMeta } from '../types';
+import { putSingleFileToDB } from '../utils/storage';
 import {
   FileText,
   Upload,
@@ -6,6 +8,8 @@ import {
   X,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   Layers,
   Link as LinkIcon,
   Download,
@@ -18,10 +22,10 @@ import {
 } from 'lucide-react';
 
 interface DropZoneProps {
-  files: File[];
-  onFilesAdded: (files: File[]) => void;
-  onFilesAddedAndExtractDirectly?: (files: File[]) => void;
-  onFileRemoved: (index: number) => void;
+  files: QueuedFileMeta[];
+  onFilesAdded: (files: QueuedFileMeta[]) => void;
+  onFilesAddedAndExtractDirectly?: (files: QueuedFileMeta[]) => void;
+  onFileRemoved: (fileId: string) => void;
   onClearAll: () => void;
   disabled?: boolean;
 }
@@ -38,6 +42,10 @@ export const DropZone: React.FC<DropZoneProps> = ({
   const [uploadSource, setUploadSource] = useState<'local' | 'url'>('local');
   const [isDragOver, setIsDragOver] = useState(false);
   const [isQueueExpanded, setIsQueueExpanded] = useState(true);
+
+  // Queue Pagination State
+  const [queuePage, setQueuePage] = useState(1);
+  const [queuePageSize, setQueuePageSize] = useState<number>(25);
 
   // URL fetch state
   const [urlInput, setUrlInput] = useState('');
@@ -64,6 +72,14 @@ export const DropZone: React.FC<DropZoneProps> = ({
     total: 0,
     percent: 0,
   });
+
+  const totalQueuePages = Math.max(1, Math.ceil(files.length / queuePageSize));
+
+  useEffect(() => {
+    if (queuePage > totalQueuePages) {
+      setQueuePage(totalQueuePages);
+    }
+  }, [queuePage, totalQueuePages]);
 
   const checkPauseOrCancel = async (): Promise<boolean> => {
     while (isPausedRef.current && !isCancelledRef.current) {
@@ -101,29 +117,33 @@ export const DropZone: React.FC<DropZoneProps> = ({
 
     setLoadProgress({
       active: true,
-      title: `Reading local PDF file(s)...`,
+      title: `Saving local PDF file(s) to storage...`,
       current: 0,
       total: pdfFiles.length,
       percent: 0,
     });
 
+    const baseOrder = Date.now();
+
     for (let i = 0; i < pdfFiles.length; i++) {
       if (await checkPauseOrCancel()) break;
 
       const file = pdfFiles[i];
+      const meta = await putSingleFileToDB(file, baseOrder + i);
+
       const pct = Math.round(((i + 1) / pdfFiles.length) * 100);
       setLoadProgress({
         active: true,
-        title: `Loaded ${i + 1} of ${pdfFiles.length}: ${file.name}`,
+        title: `Queued ${i + 1} of ${pdfFiles.length}: ${file.name}`,
         current: i + 1,
         total: pdfFiles.length,
         percent: pct,
       });
 
-      // IMMEDIATELY add each file to queue as soon as it's processed!
-      onFilesAdded([file]);
+      onFilesAdded([meta]);
 
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      // Yield briefly to keep UI responsive during large batch uploads
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
     setTimeout(() => {
@@ -148,7 +168,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
 
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const pdfFiles = (Array.from(e.dataTransfer.files) as File[]).filter(
-        f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
+        (f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
       );
       if (pdfFiles.length > 0) {
         processLocalFiles(pdfFiles);
@@ -159,7 +179,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
       const selected = (Array.from(e.target.files) as File[]).filter(
-        f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
+        (f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
       );
       if (selected.length > 0) {
         processLocalFiles(selected);
@@ -189,6 +209,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
     setIsFetchingUrl(true);
 
     const urlConcurrency = Math.min(6, rawUrls.length);
+    const baseOrder = Date.now();
 
     setLoadProgress({
       active: true,
@@ -198,7 +219,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
       percent: 0,
     });
 
-    const fetchedFilesSlots: (File | null)[] = new Array(rawUrls.length).fill(null);
+    const fetchedMetaSlots: (QueuedFileMeta | null)[] = new Array(rawUrls.length).fill(null);
     const errorsSlots: (string | null)[] = new Array(rawUrls.length).fill(null);
     let nextUrlIndex = 0;
     let completedCount = 0;
@@ -253,12 +274,14 @@ export const DropZone: React.FC<DropZoneProps> = ({
             fileName += '.pdf';
           }
 
-          const file = new File([blob], fileName, { type: 'application/pdf' });
-          (file as any).sourceUrl = url;
-          fetchedFilesSlots[idx] = file;
+          const tempFile = new File([blob], fileName, { type: 'application/pdf' });
+          (tempFile as any).sourceUrl = url;
 
-          // Instantly enter file into queue as soon as fetched!
-          onFilesAdded([file]);
+          // Persist Blob directly to IndexedDB and keep ONLY lightweight metadata in React RAM
+          const meta = await putSingleFileToDB(tempFile, baseOrder + idx);
+          fetchedMetaSlots[idx] = meta;
+
+          onFilesAdded([meta]);
         } catch (err: any) {
           if (err?.name !== 'AbortError' && !isCancelledRef.current) {
             console.error('Failed to fetch PDF from URL:', url, err);
@@ -283,7 +306,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
 
     await Promise.all(Array.from({ length: urlConcurrency }, () => fetchWorker()));
 
-    const fetchedFiles = fetchedFilesSlots.filter((f): f is File => f !== null);
+    const fetchedMetas = fetchedMetaSlots.filter((m): m is QueuedFileMeta => m !== null);
     const errors = errorsSlots.filter((e): e is string => e !== null);
 
     setIsFetchingUrl(false);
@@ -291,22 +314,22 @@ export const DropZone: React.FC<DropZoneProps> = ({
       setLoadProgress((prev) => ({ ...prev, active: false }));
     }, 500);
 
-    if (fetchedFiles.length > 0) {
+    if (fetchedMetas.length > 0) {
       setUrlInput('');
       if (autoExtract && onFilesAddedAndExtractDirectly) {
-        onFilesAddedAndExtractDirectly(fetchedFiles);
+        onFilesAddedAndExtractDirectly(fetchedMetas);
       }
       if (errors.length === 0) {
         setUrlStatus({
           type: 'success',
           message: autoExtract
-            ? `Loaded ${fetchedFiles.length} PDF(s) and started extraction!`
-            : `Successfully loaded ${fetchedFiles.length} PDF(s) to queue!`,
+            ? `Loaded ${fetchedMetas.length} PDF(s) and started extraction!`
+            : `Successfully loaded ${fetchedMetas.length} PDF(s) to queue!`,
         });
       } else {
         setUrlStatus({
           type: 'error',
-          message: `Loaded ${fetchedFiles.length} PDF(s). Failed: ${errors.join(', ')}`,
+          message: `Loaded ${fetchedMetas.length} PDF(s). Failed: ${errors.join(', ')}`,
         });
       }
     } else if (!isCancelledRef.current) {
@@ -327,6 +350,9 @@ export const DropZone: React.FC<DropZoneProps> = ({
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
+
+  const queueStartIdx = (queuePage - 1) * queuePageSize;
+  const paginatedQueueFiles = files.slice(queueStartIdx, queueStartIdx + queuePageSize);
 
   return (
     <div className="w-full space-y-3">
@@ -556,7 +582,7 @@ export const DropZone: React.FC<DropZoneProps> = ({
         </div>
       )}
 
-      {/* Queued Files Collapsible Section */}
+      {/* Queued Files Collapsible & Paginated Section */}
       {files.length > 0 && (
         <div className="bg-slate-50/90 dark:bg-slate-900/90 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-2xs">
           {/* Header & Toggle */}
@@ -592,42 +618,102 @@ export const DropZone: React.FC<DropZoneProps> = ({
             </button>
           </div>
 
-          {/* Collapsible List */}
+          {/* Collapsible Paginated List */}
           {isQueueExpanded && (
-            <div className="max-h-48 overflow-y-auto p-2 space-y-1.5 text-xs">
-              {files.map((file, idx) => (
-                <div
-                  key={`${file.name}-${idx}`}
-                  className="flex items-center justify-between p-2 rounded-lg bg-white dark:bg-slate-800/90 border border-slate-200 dark:border-slate-700/80 hover:border-slate-300 dark:hover:border-slate-600 transition-colors group"
-                >
-                  <div className="flex items-center space-x-2 truncate pr-2">
-                    <FileText className="w-4 h-4 text-blue-500 dark:text-blue-400 shrink-0" />
-                    <span className="font-medium text-slate-800 dark:text-slate-100 truncate" title={file.name}>
-                      {file.name}
-                    </span>
-                    <span className="text-slate-400 dark:text-slate-400 text-[11px] shrink-0">
-                      ({formatFileSize(file.size)})
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onFileRemoved(idx);
-                    }}
-                    className="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors p-1 rounded hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
-                    title="Remove file"
-                    disabled={disabled}
+            <>
+              <div className="max-h-56 overflow-y-auto p-2 space-y-1.5 text-xs">
+                {paginatedQueueFiles.map((file, idx) => (
+                  <div
+                    key={file.id}
+                    className="flex items-center justify-between p-2 rounded-lg bg-white dark:bg-slate-800/90 border border-slate-200 dark:border-slate-700/80 hover:border-slate-300 dark:hover:border-slate-600 transition-colors group"
                   >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
+                    <div className="flex items-center space-x-2 truncate pr-2">
+                      <span className="text-[10px] font-mono text-slate-400 dark:text-slate-500 w-6 text-right shrink-0">
+                        {queueStartIdx + idx + 1}.
+                      </span>
+                      <FileText className="w-4 h-4 text-blue-500 dark:text-blue-400 shrink-0" />
+                      <span className="font-medium text-slate-800 dark:text-slate-100 truncate" title={file.name}>
+                        {file.name}
+                      </span>
+                      <span className="text-slate-400 dark:text-slate-400 text-[11px] shrink-0">
+                        ({formatFileSize(file.size)})
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onFileRemoved(file.id);
+                      }}
+                      className="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors p-1 rounded hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                      title="Remove file"
+                      disabled={disabled}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {files.length > 25 && (
+                <div className="px-3 py-2 bg-slate-100/70 dark:bg-slate-800/60 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-300">
+                  <div className="flex items-center gap-2">
+                    <span>
+                      Showing <b>{queueStartIdx + 1}</b>–<b>{Math.min(queueStartIdx + queuePageSize, files.length)}</b> of{' '}
+                      <b>{files.length}</b>
+                    </span>
+                    <div className="flex items-center gap-1">
+                      {[25, 50].map((size) => (
+                        <button
+                          key={size}
+                          type="button"
+                          onClick={() => {
+                            setQueuePageSize(size);
+                            setQueuePage(1);
+                          }}
+                          className={`px-1.5 py-0.5 rounded font-bold cursor-pointer ${
+                            queuePageSize === size
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          {size}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {totalQueuePages > 1 && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={queuePage <= 1}
+                        onClick={() => setQueuePage((p) => Math.max(1, p - 1))}
+                        className="px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-40 cursor-pointer flex items-center gap-0.5"
+                      >
+                        <ChevronLeft className="w-3 h-3" />
+                        Prev
+                      </button>
+                      <span className="px-1.5 font-mono font-bold">
+                        {queuePage}/{totalQueuePages}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={queuePage >= totalQueuePages}
+                        onClick={() => setQueuePage((p) => Math.min(totalQueuePages, p + 1))}
+                        className="px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-40 cursor-pointer flex items-center gap-0.5"
+                      >
+                        Next
+                        <ChevronRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
       )}
     </div>
   );
 };
-

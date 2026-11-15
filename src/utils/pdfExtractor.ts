@@ -13,6 +13,14 @@ if (typeof window !== 'undefined') {
   }
 }
 
+export function createPdfWorker(): pdfjsLib.PDFWorker | undefined {
+  try {
+    return new pdfjsLib.PDFWorker({ verbosity: 0 });
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseLineNumbers(input: string): number[] {
   const lines = new Set<number>();
   input.split(',').forEach(part => {
@@ -109,6 +117,24 @@ export function findAllKeywordMatches(
         continue;
       }
 
+      if (target === 'prev_line') {
+        const endIdx = i - safeOffset;
+        if (endIdx >= 0) {
+          const startIdx = Math.max(0, endIdx - safeCount + 1);
+          const collected: string[] = [];
+          for (let idx = startIdx; idx <= endIdx; idx++) {
+            const val = lines[idx]?.trim();
+            if (val) {
+              collected.push(val);
+            }
+          }
+          if (collected.length > 0) {
+            matches.push(collected.join(sep));
+          }
+        }
+        continue;
+      }
+
       if (target === 'same_line') {
         matches.push(rawLine.trim());
         continue;
@@ -147,7 +173,15 @@ export function findAllKeywordMatches(
   return matches;
 }
 
-export async function extractFastLines(file: File, scanMode: ScanMode): Promise<{ lines: string[]; links: string[] }> {
+const URL_REGEX = /(https?:\/\/[^\s<>"{}|\\^`]+|www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s<>"{}|\\^`]*)/gi;
+
+export async function extractFastLines(
+  file: File,
+  scanMode: ScanMode,
+  sharedWorker?: pdfjsLib.PDFWorker
+): Promise<{ lines: string[]; links: string[] }> {
+  let loadingTask: any = null;
+  let pdf: any = null;
   try {
     const arrayBuffer = await file.arrayBuffer();
     const typedArray = new Uint8Array(arrayBuffer);
@@ -157,14 +191,18 @@ export async function extractFastLines(file: File, scanMode: ScanMode): Promise<
       pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/build/pdf.worker.min.mjs`;
     }
 
-    const loadingTask = pdfjsLib.getDocument({
+    loadingTask = pdfjsLib.getDocument({
       data: typedArray,
+      worker: sharedWorker,
+      disableFontFace: true,
+      isEvalSupported: false,
+      verbosity: 0,
       cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/cmaps/`,
       cMapPacked: true,
       standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/standard_fonts/`,
     } as any);
 
-    const pdf = await loadingTask.promise;
+    pdf = await loadingTask.promise;
 
     const allLines: string[] = [];
     const detectedLinksSet = new Set<string>();
@@ -179,13 +217,14 @@ export async function extractFastLines(file: File, scanMode: ScanMode): Promise<
 
     for (let p = 1; p <= maxPages; p++) {
       const page = await pdf.getPage(p);
-      const textContent = await page.getTextContent();
-      
-      // Extract links from PDF Annotations
       try {
-        const annotations = await page.getAnnotations();
+        const [textContent, annotations] = await Promise.all([
+          page.getTextContent(),
+          page.getAnnotations().catch(() => []),
+        ]);
+
         if (Array.isArray(annotations)) {
-          for (const annot of annotations) {
+          for (const annot of annotations as any[]) {
             if (annot.url && typeof annot.url === 'string') {
               detectedLinksSet.add(annot.url.trim());
             } else if (annot.unsafeUrl && typeof annot.unsafeUrl === 'string') {
@@ -193,44 +232,60 @@ export async function extractFastLines(file: File, scanMode: ScanMode): Promise<
             }
           }
         }
-      } catch (annotErr) {
-        // annotations are optional
-      }
 
-      // Group text items by Y coordinate with a 3px tolerance band for better line grouping
-      const textGroups: { [yBand: number]: any[] } = {};
-      for (const item of textContent.items as any[]) {
-        if (!item.str || !item.str.trim()) continue;
-        const y = item.transform[5];
-        const yBand = Math.round(y / 3) * 3; // 3px tolerance clustering
-        if (!textGroups[yBand]) textGroups[yBand] = [];
-        textGroups[yBand].push(item);
+        // Group text items by Y coordinate with a 3px tolerance band using Map
+        const textGroups = new Map<number, any[]>();
+        for (const item of textContent.items as any[]) {
+          if (!item.str || !item.str.trim()) continue;
+          const y = item.transform[5];
+          const yBand = Math.round(y / 3) * 3;
+          let group = textGroups.get(yBand);
+          if (!group) {
+            group = [];
+            textGroups.set(yBand, group);
+          }
+          group.push(item);
 
-        // Regex check for web links in text item
-        const urlMatches = item.str.match(/(https?:\/\/[^\s<>"{}|\\^`]+|www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s<>"{}|\\^`]*)/gi);
-        if (urlMatches) {
-          urlMatches.forEach((u: string) => detectedLinksSet.add(u.trim()));
+          // Regex check for web links in text item
+          const urlMatches = item.str.match(URL_REGEX);
+          if (urlMatches) {
+            for (const u of urlMatches) {
+              detectedLinksSet.add(u.trim());
+            }
+          }
         }
+
+        // Sort Y descending (top of page to bottom)
+        const sortedY = Array.from(textGroups.keys()).sort((a, b) => b - a);
+        for (const yBand of sortedY) {
+          const lineItems = textGroups.get(yBand)!.sort((a, b) => a.transform[4] - b.transform[4]);
+          const lineText = lineItems.map((item) => item.str).join(' ').trim();
+          if (lineText) allLines.push(lineText);
+        }
+      } finally {
+        page.cleanup();
       }
 
-      // Sort Y descending (top of page to bottom)
-      const sortedY = Object.keys(textGroups).map(Number).sort((a, b) => b - a);
-      for (const yBand of sortedY) {
-        // Sort items X ascending (left to right)
-        const lineItems = textGroups[yBand].sort((a, b) => a.transform[4] - b.transform[4]);
-        const lineText = lineItems.map(item => item.str).join(' ').trim();
-        if (lineText) allLines.push(lineText);
+      if (p % 15 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
       }
-      page.cleanup();
     }
 
-    if (typeof (pdf as any).destroy === 'function') {
-      await (pdf as any).destroy();
-    }
     return { lines: allLines, links: Array.from(detectedLinksSet) };
   } catch (err: any) {
     console.error('PDF extraction failed for file:', file.name, err);
     throw err;
+  } finally {
+    try {
+      if (pdf && typeof pdf.destroy === 'function') {
+        await pdf.destroy();
+      }
+      if (loadingTask && typeof loadingTask.destroy === 'function') {
+        await loadingTask.destroy();
+      }
+    } catch {
+      // ignore cleanup errors
+    }
   }
 }
 
@@ -248,7 +303,13 @@ export interface TableColumnSlot {
  * - Merges multi-line wrapped text inside table cells
  * - Auto-detects table headers and supports RTL / Arabic PDF text
  */
-export async function extractTablesFromPDF(file: File, scanMode: ScanMode): Promise<ExtractedRow[]> {
+export async function extractTablesFromPDF(
+  file: File,
+  scanMode: ScanMode,
+  sharedWorker?: pdfjsLib.PDFWorker
+): Promise<ExtractedRow[]> {
+  let loadingTask: any = null;
+  let pdf: any = null;
   try {
     const arrayBuffer = await file.arrayBuffer();
     const typedArray = new Uint8Array(arrayBuffer);
@@ -257,14 +318,18 @@ export async function extractTablesFromPDF(file: File, scanMode: ScanMode): Prom
       pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/build/pdf.worker.min.mjs`;
     }
 
-    const loadingTask = pdfjsLib.getDocument({
+    loadingTask = pdfjsLib.getDocument({
       data: typedArray,
+      worker: sharedWorker,
+      disableFontFace: true,
+      isEvalSupported: false,
+      verbosity: 0,
       cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/cmaps/`,
       cMapPacked: true,
       standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version || '4.0.379'}/standard_fonts/`,
     } as any);
 
-    const pdf = await loadingTask.promise;
+    pdf = await loadingTask.promise;
     const extractedTableRows: ExtractedRow[] = [];
     const maxPages = scanMode === 'first_page' ? 1 : pdf.numPages;
 
@@ -508,16 +573,26 @@ export async function extractTablesFromPDF(file: File, scanMode: ScanMode): Prom
       }
 
       page.cleanup();
-    }
-
-    if (typeof (pdf as any).destroy === 'function') {
-      await (pdf as any).destroy();
+      if (p % 10 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
 
     return extractedTableRows;
   } catch (err: any) {
     console.error('Table extraction failed for file:', file.name, err);
     throw err;
+  } finally {
+    try {
+      if (pdf && typeof pdf.destroy === 'function') {
+        await pdf.destroy();
+      }
+      if (loadingTask && typeof loadingTask.destroy === 'function') {
+        await loadingTask.destroy();
+      }
+    } catch {
+      // ignore cleanup errors
+    }
   }
 }
 

@@ -1,7 +1,16 @@
 export type ExtractMode = 'line_numbers' | 'keywords' | 'combined' | 'tables';
 export type ScanMode = 'first_page' | 'all_pages';
-export type KeywordMatchTarget = 'smart' | 'next_line' | 'same_line';
+export type KeywordMatchTarget = 'smart' | 'next_line' | 'prev_line' | 'same_line';
 export type KeywordLineSeparator = 'newline' | 'space' | 'pipe';
+
+export interface QueuedFileMeta {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  sourceUrl?: string;
+}
 
 export interface ExtractedRow {
   'File Name': string;
